@@ -24,6 +24,7 @@ import random
 import gymnasium as gym
 import hydra
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -157,11 +158,20 @@ class DynaPPOAgent(PPOAgent):
             batch = random.sample(self.real_buffer, self.model_batch_size)
             states, actions, rewards, next_states, _ = zip(*batch)
 
+            states = torch.tensor(states, dtype=torch.float32)
+            actions = torch.tensor(actions, dtype=torch.int64)
+            rewards = torch.tensor(rewards, dtype=torch.float32)
+            next_states = torch.tensor(next_states, dtype=torch.float32)
+
             # TODO: Predict next state delta and reward using the model
+            a_oh = F.one_hot(actions, self.env.action_space.n).float()
+            # print(f"train_model - {states.shape=} - {a_oh.shape}")
+            delta_s, r_pred = self.model(states.flatten(1), a_oh)
+
             # TODO: Compute loss for state prediction and reward prediction
-            loss_s = ...  # Placeholder for state loss
-            loss_r = ...  # Placeholder for reward loss
-            loss = ...  # Placeholder for total loss
+            loss_s = F.mse_loss(delta_s, next_states - states)  # Placeholder for state loss
+            loss_r = F.mse_loss(r_pred, rewards)  # Placeholder for reward loss
+            loss = loss_s + loss_r  # Placeholder for total loss
 
             self.model_opt.zero_grad()
             loss.backward()
@@ -196,16 +206,25 @@ class DynaPPOAgent(PPOAgent):
             }
 
         # TODO: Sample a batch of transitions from the replay buffer
-        val_batch = ...
+        val_batch = random.sample(self.real_buffer, num_samples)
         states, actions, rewards, next_states, _ = zip(*val_batch)
+
+        states = torch.tensor(states, dtype=torch.float32)
+        actions = torch.tensor(actions, dtype=torch.int64)
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        next_states = torch.tensor(next_states, dtype=torch.float32)
+        a_oh = F.one_hot(actions, self.env.action_space.n).float()
 
         # TODO: Compute MSE (L2) and MAE (L1) for both state and reward predictions
         with torch.no_grad():
+            # print(f"eval_model - {states.shape=} - {a_oh.shape}")
+            delta_s, r_pred = self.model(states.flatten(1), a_oh)
+
             # Calculate metrics
-            state_mse = ...
-            reward_mse = ...
-            state_mae = ...
-            reward_mae = ...
+            state_mse  = F.mse_loss(delta_s, next_states - states).item()
+            reward_mse = F.mse_loss(r_pred, rewards).item()
+            state_mae  = F.l1_loss(delta_s, next_states - states).item()
+            reward_mae = F.l1_loss(r_pred, rewards).item()
 
         return {
             "state_mse": state_mse,
@@ -236,21 +255,22 @@ class DynaPPOAgent(PPOAgent):
             # TODO: Simulate a trajectory using the model
             for step in range(self.imag_horizon):
                 # TODO: Predict action, log-probability, entropy, and value from the PPO policy
-                action, logp, ent, val = ...
+                action, logp, ent, val = self.predict(s)
 
                 # TODO: Prepare model input tensors
                 a_oh = (  # noqa: F841
-                    F.one_hot(torch.tensor(...), self.env.action_space.n)
+                    F.one_hot(torch.tensor(action), self.env.action_space.n)
                     .unsqueeze(0)
                     .float()
                 )  # noqa: F841
-                s_t = torch.tensor(..., dtype=torch.float32).unsqueeze(0)  # noqa: F841
+                s_t = torch.tensor(s, dtype=torch.float32).unsqueeze(0)  # noqa: F841
 
                 # TODO: Predict next state delta and reward
                 with torch.no_grad():  # Don't track gradients during imagination
-                    delta, r_pred = ...
-                    s2 = ...
-                    r_val = ...
+                    # print(f"imag & up - {s_t.shape=} - {a_oh.shape}")
+                    delta, r_pred = self.model(s_t.flatten(1), a_oh)
+                    s2 = (s_t + delta).squeeze(0).numpy()
+                    r_val = r_pred.item()
 
                 # Add some termination probability to make rollouts more realistic
                 done_prob = 0.05  # 5% chance of termination per step
@@ -418,6 +438,10 @@ class DynaPPOAgent(PPOAgent):
         eval_env = gym.make(self.env.spec.id)
         set_seed(eval_env, self.seed)
 
+        steps = list()
+        eval_mean_r = list()
+        eval_std_r = list()
+
         while self.real_steps < total_steps:
             state, _ = self.env.reset()
             done = False
@@ -426,8 +450,8 @@ class DynaPPOAgent(PPOAgent):
 
             # TODO: Collect one real trajectory (episode)
             while not done and self.real_steps < total_steps:
-                action, logp, ent, val = ...
-                next_state, reward, term, trunc, _ = ...
+                action, logp, ent, val = self.predict(state)
+                next_state, reward, term, trunc, _ = self.env.step(action)
                 done = term or trunc
                 real_traj.append(
                     (state, action, logp, ent, reward, float(done), next_state)
@@ -439,6 +463,9 @@ class DynaPPOAgent(PPOAgent):
                 # Evaluation
                 if self.real_steps % eval_interval == 0:
                     mean_r, std_r = self.evaluate(eval_env, num_episodes=eval_episodes)
+                    steps.append(self.real_steps)
+                    eval_mean_r.append(mean_r)
+                    eval_std_r.append(std_r)
                     stats = self.get_step_statistics()
                     if self.use_model:
                         print(
@@ -469,7 +496,7 @@ class DynaPPOAgent(PPOAgent):
             self.total_episodes += 1
 
             # TODO: Perform PPO update on real transitions
-            policy_loss, value_loss, entropy_loss = ...
+            policy_loss, value_loss, entropy_loss = self.update(real_traj)
             last_return = sum(r for *_, r, _, _ in real_traj)
 
             # 2) Model-based steps if enabled
@@ -479,8 +506,8 @@ class DynaPPOAgent(PPOAgent):
             # TODO: If using model, train it and perform imagined updates
             if self.use_model:
                 self.store_real(real_traj)
-                model_state_loss, model_reward_loss = ...
-                imag_policy_loss, imag_value_loss, imag_entropy_loss = ...
+                model_state_loss, model_reward_loss = self.train_model()
+                imag_policy_loss, imag_value_loss, imag_entropy_loss = self.imagine_and_update()
 
             # Unified logging with step tracking
             stats = self.get_step_statistics()
@@ -511,48 +538,53 @@ class DynaPPOAgent(PPOAgent):
             f"Imagination steps: {final_stats['imagination_steps']}, "
             f"Total episodes: {final_stats['total_episodes']}"
         )
+        evaluation_data = pd.DataFrame({"steps": steps, "mean_returns": eval_mean_r, "std_returns": eval_std_r})
+        evaluation_data.to_csv(f"evaluation_data_seed_{self.seed}_{'with' if self.use_model else 'without'}_model.csv", index=False)
 
 
 @hydra.main(config_path="../configs/agent/", config_name="dyna_ppo", version_base="1.1")
 def main(cfg: DictConfig) -> None:
-    env = gym.make(cfg.env.name)
-    set_seed(env, cfg.seed)
+    for seed in cfg.seeds:
+        env = gym.make(cfg.env.name)
+        # env = gym.make(cfg.env.name, render_mode="human")
+        set_seed(env, seed)
 
-    agent = DynaPPOAgent(
-        env,
-        use_model=cfg.agent.use_model,
-        lr_actor=cfg.agent.lr_actor,
-        lr_critic=cfg.agent.lr_critic,
-        gamma=cfg.agent.gamma,
-        gae_lambda=cfg.agent.gae_lambda,
-        clip_eps=cfg.agent.clip_eps,
-        epochs=cfg.agent.epochs,
-        batch_size=cfg.agent.batch_size,
-        ent_coef=cfg.agent.ent_coef,
-        vf_coef=cfg.agent.vf_coef,
-        seed=cfg.seed,
-        hidden_size=cfg.agent.hidden_size,
-        # Dyna-specific
-        model_lr=cfg.agent.model_lr,
-        model_epochs=cfg.agent.model_epochs,
-        model_batch_size=cfg.agent.model_batch_size,
-        imag_horizon=cfg.agent.imag_horizon,
-        imag_batches=cfg.agent.imag_batches,
-        max_buffer_size=cfg.agent.max_buffer_size,
-    )
+        agent = DynaPPOAgent(
+            env,
+            use_model=cfg.agent.use_model,
+            lr_actor=cfg.agent.lr_actor,
+            lr_critic=cfg.agent.lr_critic,
+            gamma=cfg.agent.gamma,
+            gae_lambda=cfg.agent.gae_lambda,
+            clip_eps=cfg.agent.clip_eps,
+            epochs=cfg.agent.epochs,
+            batch_size=cfg.agent.batch_size,
+            ent_coef=cfg.agent.ent_coef,
+            vf_coef=cfg.agent.vf_coef,
+            seed=seed,
+            hidden_size=cfg.agent.hidden_size,
+            # Dyna-specific
+            model_lr=cfg.agent.model_lr,
+            model_epochs=cfg.agent.model_epochs,
+            model_batch_size=cfg.agent.model_batch_size,
+            imag_horizon=cfg.agent.imag_horizon,
+            imag_batches=cfg.agent.imag_batches,
+            max_buffer_size=cfg.agent.max_buffer_size,
+        )
 
-    # Load checkpoint if specified
-    if hasattr(cfg, "checkpoint_path") and cfg.checkpoint_path:
-        agent.load_checkpoint(cfg.checkpoint_path)
+        # Load checkpoint if specified
+        if hasattr(cfg, "checkpoint_path") and cfg.checkpoint_path:
+            agent.load_checkpoint(cfg.checkpoint_path)
 
-    agent.train(
-        cfg.train.total_steps,
-        cfg.train.eval_interval,
-        cfg.train.eval_episodes,
-        cfg.train.get("model_eval_interval", 50000),
-        cfg.train.get("save_interval", 100000),
-        cfg.train.get("save_dir", "./checkpoints"),
-    )
+        agent.train(
+            cfg.train.total_steps,
+            cfg.train.eval_interval,
+            cfg.train.eval_episodes,
+            cfg.train.get("model_eval_interval", 1000),
+            cfg.train.get("save_interval", 100000),
+            cfg.train.get("save_dir", "./checkpoints"),
+        )
+        env.close()
 
 
 if __name__ == "__main__":

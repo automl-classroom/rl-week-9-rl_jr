@@ -1,0 +1,9 @@
+Level 1
+
+    - 1.1 Sample Efficiency:
+        1. Dyna-PPO reaches 1000 steps sooner 80 % of the final PPO return (with a return of 221.72 at 13,000 steps compared to a return of 220.6 at 14,000 steps for PPO)
+        2. there seems to be a “model learning penalty”, since Dyna-PPO's performance is (generally) lower than that of PPO during the first ~10,000 steps
+
+    - 1.2 Model Prediction Accuracy:
+        1. 
+        2. 
